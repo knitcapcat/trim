@@ -202,18 +202,27 @@ class Attention(nn.Module):
         #   block_table:  block_tables[i] = 请求 i 的物理 block 列表
         #   causal=True:  decoder-only 模型用 causal mask
         # ============================================================
+        # cu_seqlens_k: KV cache 累积序列长度
+        # 例如 seq_lens=[5, 21] → cu_seqlens_k=[0, 5, 26]
+        # 某些版本的 flash_attn 用 seqused_k 替代, 但 ROCm 版本需要 cu_seqlens_k
+        cu_seqlens_k = torch.zeros(
+            attn_metadata.seq_lens.shape[0] + 1,
+            dtype=torch.int32,
+            device=attn_metadata.seq_lens.device,
+        )
+        torch.cumsum(attn_metadata.seq_lens, dim=0, out=cu_seqlens_k[1:])
+
         output = flash_attn_varlen_func(
             q=q,
             k=key_cache,
             v=value_cache,
             cu_seqlens_q=attn_metadata.query_start_loc,
-            cu_seqlens_k=None,       # 用 seqused_k 替代
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=attn_metadata.max_query_len,
             max_seqlen_k=attn_metadata.max_seq_len,
             softmax_scale=self.scale,
             causal=True,
             block_table=attn_metadata.block_tables,
-            seqused_k=attn_metadata.seq_lens,
         )
 
         # output: [num_tokens, num_heads, head_dim] → [num_tokens, num_heads * head_dim]

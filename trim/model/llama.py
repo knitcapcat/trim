@@ -72,9 +72,11 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        orig_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(x.dtype)
+        return (self.weight * x).to(orig_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +123,8 @@ class RotaryEmbedding(nn.Module):
         cos = freqs.cos()  # [total_tokens, head_dim/2]
         sin = freqs.sin()  # [total_tokens, head_dim/2]
 
-        q = self._apply_rotary(q, cos, sin)
-        k = self._apply_rotary(k, cos, sin)
+        q = self._apply_rotary(q, cos, sin).to(q.dtype)
+        k = self._apply_rotary(k, cos, sin).to(k.dtype)
         return q, k
 
     @staticmethod

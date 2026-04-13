@@ -58,7 +58,7 @@ class LLM:
         dtype: str = "auto",
         max_model_len: Optional[int] = None,
         gpu_memory_utilization: float = 0.9,
-        block_size: int = 16,
+        block_size: int = 128,
         max_num_seqs: int = 256,
         max_num_batched_tokens: int = 2048,
     ) -> None:

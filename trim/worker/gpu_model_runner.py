@@ -147,7 +147,7 @@ class GPUModelRunner:
 
         # --- Step 2: 测量峰值，计算可用显存 ---
         peak_memory = torch.cuda.max_memory_allocated(self.device)
-        total_memory = torch.cuda.get_device_properties(self.device).total_mem
+        total_memory = torch.cuda.get_device_properties(self.device).total_memory
         available_memory = total_memory - peak_memory
 
         # 清理 profiling 分配的中间 tensor
