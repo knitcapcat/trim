@@ -18,7 +18,7 @@ from trim.engine.llm import LLM
 def main():
     parser = argparse.ArgumentParser(description="trim offline inference")
     parser.add_argument(
-        "--model", type=str, default="meta-llama/Llama-3.2-1B",
+        "--model", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         help="HuggingFace model name or local path",
     )
     parser.add_argument("--max-tokens", type=int, default=128)
