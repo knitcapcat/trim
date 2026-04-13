@@ -98,54 +98,73 @@ class GPUModelRunner:
         if cfg.max_model_len is None:
             cfg.max_model_len = cfg.max_position_embeddings
 
-        # 2. 创建 trim 模型并加载权重
+        # 2. 创建 trim 模型 (随机权重) 并移到 GPU
         self.model = LlamaForCausalLM(cfg).to(self.dtype).to(self.device)
 
-        # 加载 HuggingFace 预训练权重
-        # vLLM 使用 model_loader + stacked_params_mapping
-        # 我们在 LlamaForCausalLM.load_weights() 中处理了 q/k/v → qkv 的映射
-        from transformers import AutoModelForCausalLM
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            cfg.model, torch_dtype=self.dtype
-        )
-        self.model.load_weights(dict(hf_model.model.named_parameters()))
-        # lm_head 权重: 有些模型 tie_word_embeddings，lm_head 和 embed_tokens 共享
-        if hasattr(hf_model, "lm_head") and not hf_config.tie_word_embeddings:
-            self.model.lm_head.weight.data.copy_(hf_model.lm_head.weight.data)
-        else:
+        # 3. 流式加载 HuggingFace 权重 (逐 tensor, 不加载整个 HF 模型)
+        # vLLM 对应: model_loader + AutoWeightsLoader
+        from trim.model.model_loader import load_weights_from_hf
+        load_weights_from_hf(self.model, cfg)
+
+        # 4. 处理 tie_word_embeddings (lm_head 和 embed_tokens 共享权重)
+        if hf_config.tie_word_embeddings:
             self.model.lm_head.weight = self.model.model.embed_tokens.weight
-        del hf_model  # 释放 HF 模型显存
 
     def profile_and_init_kv_cache(self) -> int:
         """
-        Profile GPU 剩余显存，计算能分配多少 KV cache blocks。
+        通过 dummy forward 精确测量显存占用，再分配 KV cache。
 
-        vLLM 对应: GPUModelRunner 中的 profile_run + determine_num_available_blocks
-        vLLM 跑一次 dummy forward 来精确测量显存占用。
-        我们用简化的估算。
+        vLLM 对应:
+          Worker.determine_available_memory() → profile_run()
+          Worker.initialize_cache()
+
+        流程:
+          1. 清空 CUDA 显存统计
+          2. 跑一次 dummy forward (最大 batch，暴露所有隐藏分配)
+          3. 测量峰值显存 → 计算剩余
+          4. 剩余 × gpu_memory_utilization → KV cache 预算
+          5. 分配 KV cache tensor
+
+        为什么要 dummy forward？因为实际占用远超 model.parameters():
+          model weights:     7.0 GB
+          CUDA context:     ~0.5 GB  ← 运行时本身
+          cuBLAS workspace: ~0.3 GB  ← matmul 临时 buffer
+          activation peaks: ~1.0 GB  ← forward 中间 tensor
+          fragmentation:    ~0.2 GB  ← allocator 碎片
+          actual:           ~9.0 GB  ← 比参数大 2GB!
 
         Returns: num_gpu_blocks
         """
         cfg = self.model_config
         cache_cfg = self.cache_config
 
-        # 估算每个 block 的显存
-        # 每层每 block: 2(K+V) * block_size * num_kv_heads * head_dim * dtype_size
+        # --- Step 1: Dummy forward profiling ---
+        # vLLM 对应: GPUModelRunner.profile_run()
+        torch.cuda.reset_peak_memory_stats(self.device)
+        torch.cuda.empty_cache()
+
+        self._profile_run()
+
+        # --- Step 2: 测量峰值，计算可用显存 ---
+        peak_memory = torch.cuda.max_memory_allocated(self.device)
+        total_memory = torch.cuda.get_device_properties(self.device).total_mem
+        available_memory = total_memory - peak_memory
+
+        # 清理 profiling 分配的中间 tensor
+        torch.cuda.empty_cache()
+
+        # --- Step 3: 计算 num_gpu_blocks ---
         dtype_size = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
         bytes_per_block_per_layer = (
             2 * cache_cfg.block_size * cfg.num_key_value_heads * cfg.head_dim * dtype_size
         )
         bytes_per_block = bytes_per_block_per_layer * cfg.num_hidden_layers
 
-        # 可用显存
-        free_memory, total_memory = torch.cuda.mem_get_info(self.device)
-        kv_cache_memory = int(free_memory * cache_cfg.gpu_memory_utilization)
-        num_gpu_blocks = kv_cache_memory // bytes_per_block
-        num_gpu_blocks = max(num_gpu_blocks, 1)
+        kv_cache_memory = int(available_memory * cache_cfg.gpu_memory_utilization)
+        num_gpu_blocks = max(kv_cache_memory // bytes_per_block, 1)
 
-        # 分配 KV cache tensor
-        # vLLM 的 flash_attn backend shape: [2, num_blocks, block_size, num_kv_heads, head_dim]
-        # 每层一个 tensor
+        # --- Step 4: 分配 KV cache tensor ---
+        # vLLM flash_attn layout: [2, num_blocks, block_size, num_kv_heads, head_dim]
         self.kv_caches = []
         for _ in range(cfg.num_hidden_layers):
             kv_cache = torch.zeros(
@@ -161,6 +180,64 @@ class GPUModelRunner:
 
         cache_cfg.num_gpu_blocks = num_gpu_blocks
         return num_gpu_blocks
+
+    @torch.inference_mode()
+    def _profile_run(self) -> None:
+        """
+        跑一次 dummy forward 来暴露所有隐藏的 CUDA 内存分配。
+
+        vLLM 对应: GPUModelRunner.profile_run()
+        vLLM 用 max_num_batched_tokens 构造最大 batch 来测量峰值。
+        我们用一个小 batch 来近似（不如 vLLM 精确但足够用）。
+        """
+        cfg = self.model_config
+        dummy_batch_size = min(4, cfg.max_model_len or 128)
+
+        dummy_input_ids = torch.zeros(
+            dummy_batch_size, dtype=torch.long, device=self.device
+        )
+        dummy_positions = torch.arange(
+            dummy_batch_size, dtype=torch.long, device=self.device
+        )
+
+        # 临时构造 dummy KV cache (每层 1 block, forward 完就删)
+        dummy_kv_caches = []
+        for _ in range(cfg.num_hidden_layers):
+            dummy_kv = torch.zeros(
+                2, 1, self.cache_config.block_size,
+                cfg.num_key_value_heads, cfg.head_dim,
+                dtype=self.dtype, device=self.device,
+            )
+            dummy_kv_caches.append(dummy_kv)
+
+        dummy_attn_metadata = AttentionMetadata(
+            query_start_loc=torch.arange(
+                dummy_batch_size + 1, dtype=torch.int32, device=self.device
+            ),
+            seq_lens=torch.ones(
+                dummy_batch_size, dtype=torch.int32, device=self.device
+            ),
+            max_query_len=1,
+            max_seq_len=1,
+            block_tables=torch.zeros(
+                dummy_batch_size, 1, dtype=torch.int32, device=self.device
+            ),
+            slot_mapping=torch.zeros(
+                dummy_batch_size, dtype=torch.int64, device=self.device
+            ),
+            num_actual_tokens=dummy_batch_size,
+        )
+
+        # Forward pass → 触发所有 CUDA 内存分配
+        hidden = self.model(
+            dummy_input_ids, dummy_positions, dummy_kv_caches, dummy_attn_metadata
+        )
+        logits = self.model.compute_logits(hidden)
+
+        # 清理 dummy tensors
+        del logits, hidden, dummy_kv_caches, dummy_attn_metadata
+        del dummy_input_ids, dummy_positions
+        torch.cuda.synchronize(self.device)
 
     def _prepare_inputs(
         self,
